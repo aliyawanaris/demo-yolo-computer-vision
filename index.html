@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YOLOv8 Browser Detection</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            overflow: hidden;
+        }
+        .container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .ui-overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            right: 20px;
+            z-index: 10;
+            pointer-events: none;
+        }
+        .status-card {
+            background: rgba(15, 23, 42, 0.8);
+            backdrop-filter: blur(8px);
+            padding: 12px 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.1);
+            display: inline-block;
+        }
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-right: 8px;
+            text-transform: uppercase;
+        }
+        .badge-loading { background: #eab308; color: #000; }
+        .badge-ready { background: #22c55e; color: #fff; }
+        .fps-counter { font-family: monospace; color: #38bdf8; }
+        
+        #loading-screen {
+            position: fixed;
+            inset: 0;
+            background: #0f172a;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 5px solid rgba(255,255,255,0.1);
+            border-top-color: #38bdf8;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div id="loading-screen">
+        <div class="spinner"></div>
+        <p style="margin-top: 20px;">Memuat Model AI (YOLOv8)...</p>
+        <p id="loading-status" style="font-size: 14px; opacity: 0.6;">Sedang mengunduh aset...</p>
+    </div>
+
+    <div class="container">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+        
+        <div class="ui-overlay">
+            <div class="status-card">
+                <span id="status-badge" class="badge badge-loading">Loading</span>
+                <span class="fps-counter">FPS: <span id="fps">0</span></span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const fpsDisplay = document.getElementById('fps');
+        const loadingScreen = document.getElementById('loading-screen');
+        const statusBadge = document.getElementById('status-badge');
+        
+        let session;
+        const modelName = "yolov8n.onnx";
+        
+        // Label COCO
+        const labels = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "treaty bear", "hair drier", "toothbrush"];
+
+        async function init() {
+            try {
+                // Setup Camera
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: 'environment' }, 
+                    audio: false 
+                });
+                video.srcObject = stream;
+                
+                // Load ONNX Session with GPU Acceleration (WebGL)
+                console.log("Loading model...");
+                session = await ort.InferenceSession.create(`./${modelName}`, { 
+                    executionProviders: ['webgl', 'wasm'], // Prioritize GPU
+                    graphOptimizationLevel: 'all'
+                });
+                
+                console.log("Model loaded!");
+                loadingScreen.style.display = 'none';
+                statusBadge.className = 'badge badge-ready';
+                
+                // Detect which provider is actually used
+                const provider = session.handler.constructor.name === 'WebGLBackend' ? 'GPU (WebGL)' : 'CPU (WASM)';
+                statusBadge.innerText = `Ready (${provider})`;
+                if (provider.includes('GPU')) statusBadge.style.background = '#38bdf8';
+                
+                requestAnimationFrame(detectFrame);
+            } catch (e) {
+                alert("Gagal memuat model atau kamera: " + e.message);
+            }
+        }
+
+        let isProcessing = false;
+        let lastTime = 0;
+        
+        async function detectFrame(time) {
+            const dt = time - lastTime;
+            lastTime = time;
+            fpsDisplay.innerText = Math.round(1000/dt);
+
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                
+                // 1. Gambar video dasar (Mulus 30-60 FPS)
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                // 2. Gambar kotak deteksi terakhir (Agar tidak berkedip)
+                drawOverlay();
+                
+                // 3. Jalankan deteksi baru di latar belakang (320x320)
+                if (!isProcessing && session) {
+                    isProcessing = true;
+                    
+                    setTimeout(async () => {
+                        const input = preprocess(video, 320, 320); // Gunakan 320
+                        const tensor = new ort.Tensor('float32', input, [1, 3, 320, 320]);
+                        
+                        try {
+                            const output = await session.run({ images: tensor });
+                            renderPredictions(output.output0.data);
+                        } catch (e) {
+                            alert("AI Error: " + e.message);
+                            console.error("Inference error:", e);
+                        }
+                        isProcessing = false;
+                    }, 0);
+                }
+            }
+            requestAnimationFrame(detectFrame);
+        }
+
+        function preprocess(img, width, height) {
+            const canvas_tmp = document.createElement('canvas');
+            canvas_tmp.width = width;
+            canvas_tmp.height = height;
+            const ctx_tmp = canvas_tmp.getContext('2d');
+            ctx_tmp.drawImage(img, 0, 0, width, height);
+            
+            const imageData = ctx_tmp.getImageData(0, 0, width, height);
+            const { data } = imageData;
+            const input = new Float32Array(width * height * 3);
+            
+            const area = width * height;
+            for (let i = 0; i < area; i++) {
+                input[i] = data[i * 4] / 255;
+                input[i + area] = data[i * 4 + 1] / 255;
+                input[i + area * 2] = data[i * 4 + 2] / 255;
+            }
+            return input;
+        }
+
+        let lastPredictions = [];
+
+        function renderPredictions(data) {
+            const numClasses = 80;
+            const numBoxes = 2100; // YOLOv8 320x320 has 2100 boxes
+            const threshold = 0.25; // Lowered for better detection at 320px
+            
+            lastPredictions = [];
+            
+            for (let i = 0; i < numBoxes; i++) {
+                let maxScore = 0;
+                let classId = -1;
+                
+                for (let j = 0; j < numClasses; j++) {
+                    const score = data[numBoxes * (j + 4) + i];
+                    if (score > maxScore) {
+                        maxScore = score;
+                        classId = j;
+                    }
+                }
+                
+                if (maxScore > threshold) {
+                    const cx = data[i];
+                    const cy = data[numBoxes + i];
+                    const w = data[numBoxes * 2 + i];
+                    const h = data[numBoxes * 3 + i];
+                    
+                    lastPredictions.push({
+                        box: [cx - w/2, cy - h/2, w, h],
+                        score: maxScore,
+                        classId: classId
+                    });
+                }
+            }
+        }
+
+        function drawOverlay() {
+            lastPredictions.forEach(pred => {
+                const [x, y, w, h] = pred.box;
+                const rx = x * (canvas.width / 320); // Scale from 320
+                const ry = y * (canvas.height / 320);
+                const rw = w * (canvas.width / 320);
+                const rh = h * (canvas.height / 320);
+                
+                ctx.strokeStyle = '#22c55e';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(rx, ry, rw, rh);
+                
+                ctx.fillStyle = '#22c55e';
+                ctx.font = 'bold 16px Arial';
+                const label = `${labels[pred.classId]} ${Math.round(pred.score*100)}%`;
+                ctx.fillText(label, rx, ry > 20 ? ry - 5 : ry + 20);
+            });
+        }
+
+        init();
+    </script>
+</body>
+</html>
